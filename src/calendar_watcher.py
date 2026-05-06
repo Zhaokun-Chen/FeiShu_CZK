@@ -205,7 +205,10 @@ def _send_brief_to_attendees(client: LarkCLIClient, event: CalendarEvent, brief_
         if not uid:
             continue
         try:
-            client.send_text_message(uid, text)
+            # Calendar attendee user_id may be union_id (ou_*) or open_id (oc_*).
+            # Pass explicit receive_type so the client doesn't guess wrong.
+            explicit_type = "union_id" if uid.startswith("ou_") else "open_id"
+            client.send_text_message(uid, text, receive_type=explicit_type)
         except LarkCLIError:
             pass
 

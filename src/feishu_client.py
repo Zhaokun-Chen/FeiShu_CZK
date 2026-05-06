@@ -1360,59 +1360,70 @@ class LarkCLIClient:
     # Messaging (IM)
     # ------------------------------------------------------------------
 
+    def _fetch_bot_token(self) -> str:
+        """Fetch tenant_access_token using app credentials for bot identity messaging."""
+        app_id = os.environ.get("LARK_APP_ID") or os.environ.get("FS_APP_ID")
+        app_secret = os.environ.get("LARK_APP_SECRET") or os.environ.get("FS_APP_SECRET")
+        if not app_id or not app_secret:
+            raise LarkCLIError(
+                "LARK_APP_ID / LARK_APP_SECRET not configured. "
+                "Cannot send message as app bot without app credentials."
+            )
+        req = urllib.request.Request(
+            "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
+            data=json.dumps({"app_id": app_id, "app_secret": app_secret}).encode("utf-8"),
+            headers={"Content-Type": "application/json; charset=utf-8"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            parsed = json.loads(resp.read().decode("utf-8"))
+        if parsed.get("code") != 0:
+            raise LarkCLIError(f"Bot token fetch failed: {parsed.get('msg', 'unknown')}")
+        token = parsed.get("tenant_access_token")
+        if not isinstance(token, str):
+            raise LarkCLIError("Bot token fetch returned no tenant_access_token.")
+        return token
+
     def send_text_message(self, receive_id: str, text: str, receive_type: str = "open_id") -> dict[str, Any]:
         """Send a plain-text message to a user or chat.
 
         receive_type: open_id | user_id | union_id | email | chat_id
         """
-        # Prefer bot identity (tenant token from app credentials) over user token
-        # so that messages appear from the app rather than the user themselves.
-        bot_token: str | None = None
+        # In user_token mode we MUST send as the app bot; otherwise messages appear
+        # from the user themselves. If bot token cannot be obtained, hard-fail.
+        effective_token: str | None = None
         if self.mode == "user_token":
-            app_id = os.environ.get("LARK_APP_ID") or os.environ.get("FS_APP_ID")
-            app_secret = os.environ.get("LARK_APP_SECRET") or os.environ.get("FS_APP_SECRET")
-            print(f"[DEBUG] user_token mode, app_id exists={bool(app_id)}, app_secret exists={bool(app_secret)}")
-            if app_id and app_secret:
-                try:
-                    # Auth endpoint returns tenant_access_token at root level, not inside data.
-                    req = urllib.request.Request(
-                        "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
-                        data=json.dumps({"app_id": app_id, "app_secret": app_secret}).encode("utf-8"),
-                        headers={"Content-Type": "application/json; charset=utf-8"},
-                        method="POST",
-                    )
-                    with urllib.request.urlopen(req, timeout=30) as resp:
-                        parsed = json.loads(resp.read().decode("utf-8"))
-                    print(f"[DEBUG] auth response code={parsed.get('code')}, token exists={bool(parsed.get('tenant_access_token'))}")
-                    if parsed.get("code") == 0:
-                        bot_token = parsed.get("tenant_access_token")
-                except Exception as exc:
-                    print(f"[DEBUG] bot_token error: {exc}")
-                    bot_token = None
+            effective_token = self._fetch_bot_token()
+        elif self.http_mode:
+            effective_token = self._ensure_token()
+
+        # Auto-detect ID type from prefix when caller used the default
+        final_receive_type = receive_type
+        if receive_id.startswith("ou_"):
+            final_receive_type = "union_id"
+        elif receive_id.startswith("oc_"):
+            final_receive_type = "open_id"
 
         target_id = receive_id
-        final_receive_type = receive_type
-        # Feishu global union_id starts with "ou_"; message API prefers app-scoped open_id.
-        # If conversion fails (e.g. missing contact permission), fallback to union_id type.
-        if (bot_token or self.http_mode) and receive_id.startswith("ou_"):
-            if receive_type == "open_id":
-                try:
-                    payload = self._http_request(
-                        "POST",
-                        "/contact/v3/users/batch_get_id",
-                        body={"union_ids": [receive_id]},
-                        token=bot_token,
-                    )
-                    user_list = payload.get("user_list", []) if isinstance(payload, dict) else []
-                    if user_list and isinstance(user_list[0], dict):
-                        target_id = user_list[0].get("open_id") or receive_id
-                except LarkCLIError:
-                    final_receive_type = "union_id"  # fallback to union_id type
-            elif receive_type == "union_id":
-                final_receive_type = "union_id"
+        # Convert union_id to open_id when possible (needed for cross-app messaging)
+        if effective_token and receive_id.startswith("ou_") and final_receive_type == "union_id":
+            try:
+                payload = self._http_request(
+                    "POST",
+                    "/contact/v3/users/batch_get_id",
+                    body={"union_ids": [receive_id]},
+                    token=effective_token,
+                )
+                user_list = payload.get("user_list", []) if isinstance(payload, dict) else []
+                if user_list and isinstance(user_list[0], dict):
+                    converted = user_list[0].get("open_id")
+                    if converted:
+                        target_id = converted
+                        final_receive_type = "open_id"
+            except LarkCLIError:
+                pass  # keep union_id as fallback
 
-        if bot_token or self.http_mode:
-            print(f"[DEBUG] sending msg, bot_token={bot_token is not None}, receive_type={final_receive_type}")
+        if effective_token:
             return self._http_request(
                 "POST",
                 "/im/v1/messages",
@@ -1422,7 +1433,7 @@ class LarkCLIClient:
                     "msg_type": "text",
                     "content": json.dumps({"text": text}, ensure_ascii=False),
                 },
-                token=bot_token,
+                token=effective_token,
             )
 
         # lark-cli im +messages-send uses --user-id / --chat-id, not --receive-id
@@ -1446,7 +1457,13 @@ class LarkCLIClient:
 
     def send_markdown_message(self, receive_id: str, markdown: str, receive_type: str = "open_id") -> dict[str, Any]:
         """Send a markdown message to a user or chat."""
-        if self.http_mode:
+        effective_token: str | None = None
+        if self.mode == "user_token":
+            effective_token = self._fetch_bot_token()
+        elif self.http_mode:
+            effective_token = self._ensure_token()
+
+        if effective_token:
             return self._http_request(
                 "POST",
                 "/im/v1/messages",
@@ -1462,6 +1479,7 @@ class LarkCLIClient:
                         ensure_ascii=False,
                     ),
                 },
+                token=effective_token,
             )
         payload = self._unwrap_payload(
             self._run_json(
