@@ -1,0 +1,13 @@
+# OpenClaw Meeting Agent
+# Python 3.12+
+
+# No external runtime dependencies for core logic
+# All Feishu interactions go through lark-cli (installed separately)
+
+# Optional: for LLM-enhanced extraction fallback
+# openai>=1.0.0
+
+# Development dependencies (optional)
+# pytest>=8.0.0
+# mypy>=1.9.0
+# ruff>=0.4.0
